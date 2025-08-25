@@ -87,9 +87,9 @@ export default function Home() {
       formData.append('audioFile', audioBlob, 'recording.wav')
       
       // Send to API
-      const response = await fetch('/api/transcription/transcribe', {
-        method: 'POST',
-        body: formData,
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/transcription/transcribe`, {
+      method: 'POST',
+      body: formData,
       })
       
       if (response.ok) {
