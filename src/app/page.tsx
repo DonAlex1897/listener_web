@@ -92,12 +92,22 @@ export default function Home() {
       body: formData,
       })
       
+      console.log('Response status:', response.status)
+      console.log('Response OK:', response.ok)
+      
       if (response.ok) {
-        const result: TranscriptionResponse = await response.json()
+        const responseText = await response.text()
+        console.log('Raw response:', responseText)
+        
+        const result: TranscriptionResponse = JSON.parse(responseText)
+        console.log('Parsed result:', result)
+        
         setTranscription(result.segments)
         setShowTranscription(true)
       } else {
-        throw new Error(`HTTP error! status: ${response.status}`)
+        const errorText = await response.text()
+        console.log('Error response:', errorText)
+        throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`)
       }
     } catch (error) {
       console.error('Error transcribing audio:', error)
