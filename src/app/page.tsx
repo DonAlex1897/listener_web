@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 
 type RecordingState = 'idle' | 'recording' | 'stopped'
 
@@ -18,11 +18,32 @@ export default function Home() {
   const [transcription, setTranscription] = useState<TranscriptionSegment[]>([])
   const [isTranscribing, setIsTranscribing] = useState(false)
   const [showTranscription, setShowTranscription] = useState(false)
+  const [audioLevel, setAudioLevel] = useState(0)
+  const [recordingTime, setRecordingTime] = useState(0)
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const fileExtensionRef = useRef<string>('webm')
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const animationFrameRef = useRef<number | null>(null)
+  const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current)
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close()
+      }
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current)
+      }
+    }
+  }, [])
   
   const startRecording = useCallback(async () => {
     try {
@@ -52,6 +73,35 @@ export default function Home() {
       mediaRecorderRef.current = mediaRecorder
       fileExtensionRef.current = fileExtension
       
+      // Set up audio analysis for visualization
+      audioContextRef.current = new AudioContext()
+      const source = audioContextRef.current.createMediaStreamSource(stream)
+      analyserRef.current = audioContextRef.current.createAnalyser()
+      analyserRef.current.fftSize = 256
+      source.connect(analyserRef.current)
+      
+      // Start audio level animation
+      const animate = () => {
+        if (!analyserRef.current) return
+        
+        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+        analyserRef.current.getByteFrequencyData(dataArray)
+        
+        // Calculate average audio level
+        const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length
+        const normalizedLevel = Math.min(average / 128, 1) // Normalize to 0-1
+        
+        setAudioLevel(normalizedLevel)
+        animationFrameRef.current = requestAnimationFrame(animate)
+      }
+      animate()
+      
+      // Start recording timer
+      setRecordingTime(0)
+      recordingIntervalRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1)
+      }, 1000)
+      
       audioChunksRef.current = []
       
       mediaRecorder.ondataavailable = (event) => {
@@ -79,6 +129,22 @@ export default function Home() {
       mediaRecorderRef.current.stop()
       streamRef.current.getTracks().forEach(track => track.stop())
       setState('stopped')
+      
+      // Clean up audio analysis
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current)
+        animationFrameRef.current = null
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close()
+        audioContextRef.current = null
+      }
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current)
+        recordingIntervalRef.current = null
+      }
+      
+      setAudioLevel(0)
     }
   }, [])
   
@@ -194,9 +260,36 @@ export default function Home() {
               
               {state === 'recording' && (
                 <div className="space-y-8">
-                  <div className="flex items-center justify-center space-x-4 text-red-400">
-                    <div className="w-4 h-4 bg-red-500 rounded-full animate-pulse"></div>
-                    <span className="text-lg font-medium">Recording</span>
+                  {/* Audio Visualization */}
+                  <div className="flex flex-col items-center space-y-6">
+                    {/* Timer */}
+                    <div className="text-2xl font-mono text-white">
+                      {Math.floor(recordingTime / 60).toString().padStart(2, '0')}:
+                      {(recordingTime % 60).toString().padStart(2, '0')}
+                    </div>
+                    
+                    {/* Audio Waveform Visualization */}
+                    <div className="flex items-center justify-center space-x-1 h-16">
+                      {Array.from({ length: 20 }, (_, i) => {
+                        const delay = i * 0.1
+                        const height = Math.max(4, audioLevel * 60 + Math.sin(Date.now() * 0.01 + delay) * 10)
+                        return (
+                          <div
+                            key={i}
+                            className="w-1 bg-gradient-to-t from-red-600 to-red-400 rounded-full transition-all duration-100"
+                            style={{
+                              height: `${height}px`,
+                              opacity: 0.7 + audioLevel * 0.3
+                            }}
+                          />
+                        )
+                      })}
+                    </div>
+                    
+                    <div className="flex items-center space-x-4 text-red-400">
+                      <div className="w-4 h-4 bg-red-500 rounded-full animate-pulse"></div>
+                      <span className="text-lg font-medium">Recording</span>
+                    </div>
                   </div>
                   
                   <div className="flex justify-center space-x-6">
