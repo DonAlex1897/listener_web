@@ -22,14 +22,35 @@ export default function Home() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
+  const fileExtensionRef = useRef<string>('webm')
   
   const startRecording = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current = stream
       
-      const mediaRecorder = new MediaRecorder(stream)
+      // Try formats supported by both browser and backend
+      let mimeType = 'audio/webm' // fallback
+      let fileExtension = 'webm'
+      
+      // Backend supports: WAV, MP3, M4A, FLAC, OGG, AAC
+      if (MediaRecorder.isTypeSupported('audio/ogg; codecs=opus')) {
+        mimeType = 'audio/ogg; codecs=opus'
+        fileExtension = 'ogg'
+      } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+        mimeType = 'audio/mp4'
+        fileExtension = 'm4a'
+      } else if (MediaRecorder.isTypeSupported('audio/mpeg')) {
+        mimeType = 'audio/mpeg'
+        fileExtension = 'mp3'
+      } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+        mimeType = 'audio/ogg'
+        fileExtension = 'ogg'
+      }
+      
+      const mediaRecorder = new MediaRecorder(stream, { mimeType })
       mediaRecorderRef.current = mediaRecorder
+      fileExtensionRef.current = fileExtension
       
       audioChunksRef.current = []
       
@@ -80,11 +101,12 @@ export default function Home() {
       }
       
       // Create audio blob from the latest 30 seconds
-      const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' })
+      const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm'
+      const audioBlob = new Blob(audioChunksRef.current, { type: mimeType })
       
       // Create FormData to send the file
       const formData = new FormData()
-      formData.append('audioFile', audioBlob, 'recording.wav')
+      formData.append('audioFile', audioBlob, `recording.${fileExtensionRef.current}`)
       
       // Send to API
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/transcription/transcribe`, {
