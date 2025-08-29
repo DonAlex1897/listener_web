@@ -1,5 +1,4 @@
 'use client'
-
 import { useState, useRef, useCallback, useEffect } from 'react'
 
 type RecordingState = 'idle' | 'recording' | 'stopped'
@@ -20,9 +19,11 @@ export default function Home() {
   const [showTranscription, setShowTranscription] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
   const [recordingTime, setRecordingTime] = useState(0)
+  const [bufferedDuration, setBufferedDuration] = useState(0)
+  const [bufferLimitSeconds, setBufferLimitSeconds] = useState(5)
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const audioChunksRef = useRef<Blob[]>([])
+  const audioChunksRef = useRef<{ blob: Blob; timestamp: number }[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const fileExtensionRef = useRef<string>('webm')
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -106,13 +107,18 @@ export default function Home() {
       
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data)
+          const timestamp = Date.now()
+          audioChunksRef.current.push({ blob: event.data, timestamp })
           
-          // Keep only the latest 30 seconds of audio
-          // Assuming each chunk is ~100ms, we want ~300 chunks for 30 seconds
-          if (audioChunksRef.current.length > 300) {
-            audioChunksRef.current = audioChunksRef.current.slice(-300)
-          }
+          // Keep only the latest X seconds of audio based on user selection
+          const bufferLimitMs = bufferLimitSeconds * 1000
+          const cutoffTime = timestamp - bufferLimitMs
+          audioChunksRef.current = audioChunksRef.current.filter(chunk => chunk.timestamp >= cutoffTime)
+          
+          // Update buffered duration
+          const oldestTimestamp = audioChunksRef.current.length > 0 ? audioChunksRef.current[0].timestamp : timestamp
+          const duration = Math.min((timestamp - oldestTimestamp) / 1000, bufferLimitSeconds)
+          setBufferedDuration(duration)
         }
       }
       
@@ -122,7 +128,7 @@ export default function Home() {
       console.error('Error accessing microphone:', error)
       alert('Error accessing microphone. Please ensure you have granted microphone permissions.')
     }
-  }, [])
+  }, [bufferLimitSeconds])
   
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && streamRef.current) {
@@ -145,6 +151,7 @@ export default function Home() {
       }
       
       setAudioLevel(0)
+      setBufferedDuration(0)
     }
   }, [])
   
@@ -166,9 +173,24 @@ export default function Home() {
         await new Promise(resolve => setTimeout(resolve, 200))
       }
       
-      // Create audio blob from the latest 30 seconds
+      // Create audio blob from the latest X seconds of chunks based on user selection
+      const currentTime = Date.now()
+      const bufferLimitMs = bufferLimitSeconds * 1000
+      const cutoffTime = currentTime - bufferLimitMs
+      const recentChunks = audioChunksRef.current
+        .filter(chunk => chunk.timestamp >= cutoffTime)
+        .map(chunk => chunk.blob)
+      
+      if (recentChunks.length === 0) {
+        alert('No recent audio data available')
+        return
+      }
+      
       const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm'
-      const audioBlob = new Blob(audioChunksRef.current, { type: mimeType })
+      const audioBlob = new Blob(recentChunks, { type: mimeType })
+      
+      console.log(`Sending ${recentChunks.length} audio chunks covering ${bufferedDuration.toFixed(1)} seconds (${bufferLimitSeconds}s limit) to API`)
+      console.log(`Audio blob size: ${(audioBlob.size / 1024).toFixed(1)} KB`)
       
       // Create FormData to send the file
       const formData = new FormData()
@@ -203,7 +225,7 @@ export default function Home() {
     } finally {
       setIsTranscribing(false)
     }
-  }, [stopRecording])
+  }, [stopRecording, bufferedDuration, bufferLimitSeconds])
   
   return (
     <div className="min-h-screen bg-black text-white p-6">
@@ -232,7 +254,7 @@ export default function Home() {
         <div className="relative">
           {/* Central Recording Interface */}
           <div className="bg-gray-900/50 backdrop-blur-md border border-gray-800 rounded-2xl p-8 mb-8">
-            <div className="text-center space-y-8">
+            <div className="text-center space-y-8">              
               {/* Status */}
               <div className="mb-8">
                 <div className={`inline-block px-4 py-2 rounded-full text-sm font-medium ${
@@ -262,10 +284,14 @@ export default function Home() {
                 <div className="space-y-8">
                   {/* Audio Visualization */}
                   <div className="flex flex-col items-center space-y-6">
-                    {/* Timer */}
+                    {/* Timer and Buffer Info */}
                     <div className="text-2xl font-mono text-white">
                       {Math.floor(recordingTime / 60).toString().padStart(2, '0')}:
                       {(recordingTime % 60).toString().padStart(2, '0')}
+                    </div>
+                    
+                    <div className="text-sm text-gray-400">
+                      Buffer: {bufferedDuration.toFixed(1)}s / {bufferLimitSeconds}s
                     </div>
                     
                     {/* Audio Waveform Visualization */}
@@ -349,6 +375,28 @@ export default function Home() {
                   </div>
                 </div>
               )}
+              
+              {/* Buffer Duration Selector */}
+              <div className="mb-6">
+                <label className="block text-sm text-gray-400 mb-2">Buffer Duration</label>
+                <select
+                  value={bufferLimitSeconds}
+                  onChange={(e) => setBufferLimitSeconds(Number(e.target.value))}
+                  className={`rounded-xl px-4 py-2 text-sm focus:outline-none transition-colors ${
+                    isTranscribing || state === 'recording'
+                      ? 'bg-gray-900 border border-gray-800 text-gray-500 cursor-not-allowed'
+                      : 'bg-gray-800 hover:bg-gray-700 border border-gray-700 text-white cursor-pointer focus:border-blue-500'
+                  }`}
+                  disabled={isTranscribing || state === 'recording'}
+                >
+                  <option value={5}>5 seconds</option>
+                  <option value={10}>10 seconds</option>
+                  <option value={15}>15 seconds</option>
+                  <option value={20}>20 seconds</option>
+                  <option value={25}>25 seconds</option>
+                  <option value={30}>30 seconds</option>
+                </select>
+              </div>
             </div>
           </div>
           
