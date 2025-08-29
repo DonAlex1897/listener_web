@@ -12,6 +12,68 @@ interface TranscriptionResponse {
   segments: TranscriptionSegment[]
 }
 
+// Helper function to trim audio buffer to last N samples
+function trimAudioBuffer(audioBuffers: Float32Array[], samplesToKeep: number): Float32Array {
+  const totalSamples = audioBuffers.reduce((sum, buf) => sum + buf.length, 0)
+  const startSample = Math.max(0, totalSamples - samplesToKeep)
+  
+  // Create output buffer
+  const trimmed = new Float32Array(Math.min(samplesToKeep, totalSamples))
+  
+  let outputIndex = 0
+  let currentSample = 0
+  
+  for (const buffer of audioBuffers) {
+    for (let i = 0; i < buffer.length; i++) {
+      if (currentSample >= startSample && outputIndex < trimmed.length) {
+        trimmed[outputIndex] = buffer[i]
+        outputIndex++
+      }
+      currentSample++
+    }
+  }
+  
+  return trimmed
+}
+
+// Helper function to create WAV blob from Float32Array
+function createWavBlob(audioData: Float32Array, sampleRate: number): Blob {
+  const length = audioData.length
+  const buffer = new ArrayBuffer(44 + length * 2)
+  const view = new DataView(buffer)
+  
+  // WAV header
+  const writeString = (offset: number, string: string) => {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i))
+    }
+  }
+  
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + length * 2, true)
+  writeString(8, 'WAVE')
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  writeString(36, 'data')
+  view.setUint32(40, length * 2, true)
+  
+  // Convert float samples to 16-bit PCM
+  let offset = 44
+  for (let i = 0; i < length; i++) {
+    const sample = Math.max(-1, Math.min(1, audioData[i]))
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true)
+    offset += 2
+  }
+  
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
 export default function Home() {
   const [state, setState] = useState<RecordingState>('idle')
   const [transcription, setTranscription] = useState<TranscriptionSegment[]>([])
@@ -20,16 +82,23 @@ export default function Home() {
   const [audioLevel, setAudioLevel] = useState(0)
   const [recordingTime, setRecordingTime] = useState(0)
   const [bufferedDuration, setBufferedDuration] = useState(0)
-  const [bufferLimitSeconds, setBufferLimitSeconds] = useState(5)
+  const [bufferLimitSeconds] = useState(30) // Fixed large buffer
+  const [transcribeDurationSeconds, setTranscribeDurationSeconds] = useState(10) // User selectable
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const audioChunksRef = useRef<{ blob: Blob; timestamp: number }[]>([])
+  const audioChunksRef = useRef<Blob[]>([])
   const streamRef = useRef<MediaStream | null>(null)
   const fileExtensionRef = useRef<string>('webm')
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const animationFrameRef = useRef<number | null>(null)
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const recordingStartTimeRef = useRef<number>(0)
+  
+  // Web Audio API for trimmable recording
+  const audioBufferRef = useRef<Float32Array[]>([])
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const sampleRate = useRef<number>(44100)
   
   // Cleanup on unmount
   useEffect(() => {
@@ -74,12 +143,40 @@ export default function Home() {
       mediaRecorderRef.current = mediaRecorder
       fileExtensionRef.current = fileExtension
       
-      // Set up audio analysis for visualization
+      // Set up audio analysis for visualization AND raw audio capture
       audioContextRef.current = new AudioContext()
+      sampleRate.current = audioContextRef.current.sampleRate
+      
       const source = audioContextRef.current.createMediaStreamSource(stream)
       analyserRef.current = audioContextRef.current.createAnalyser()
       analyserRef.current.fftSize = 256
       source.connect(analyserRef.current)
+      
+      // Set up raw audio capture for trimming
+      processorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1)
+      audioBufferRef.current = [] // Clear previous buffer
+      
+      processorRef.current.onaudioprocess = (event) => {
+        const inputBuffer = event.inputBuffer
+        const inputData = inputBuffer.getChannelData(0)
+        
+        // Copy the audio data (Float32Array can be safely sliced)
+        const bufferCopy = new Float32Array(inputData.length)
+        bufferCopy.set(inputData)
+        audioBufferRef.current.push(bufferCopy)
+        
+        // Keep only the last 30 seconds of audio data
+        const maxSamples = sampleRate.current * bufferLimitSeconds
+        let totalSamples = audioBufferRef.current.reduce((sum, buf) => sum + buf.length, 0)
+        
+        while (totalSamples > maxSamples && audioBufferRef.current.length > 1) {
+          const removed = audioBufferRef.current.shift()!
+          totalSamples -= removed.length
+        }
+      }
+      
+      source.connect(processorRef.current)
+      processorRef.current.connect(audioContextRef.current.destination)
       
       // Start audio level animation
       const animate = () => {
@@ -104,21 +201,56 @@ export default function Home() {
       }, 1000)
       
       audioChunksRef.current = []
+      recordingStartTimeRef.current = Date.now()
+      
+      // Log when recording actually starts
+      console.log(`🎤 RECORDING STARTED - Buffer cleared, limit: ${bufferLimitSeconds}s`)
       
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          const timestamp = Date.now()
-          audioChunksRef.current.push({ blob: event.data, timestamp })
+          const now = Date.now()
+          const timeSinceStart = now - recordingStartTimeRef.current
+          const chunkSize = event.data.size
+          audioChunksRef.current.push(event.data)
           
-          // Keep only the latest X seconds of audio based on user selection
-          const bufferLimitMs = bufferLimitSeconds * 1000
-          const cutoffTime = timestamp - bufferLimitMs
-          audioChunksRef.current = audioChunksRef.current.filter(chunk => chunk.timestamp >= cutoffTime)
+          // Maintain a strict sliding window buffer
+          const recordingIntervalMs = 100 // We're recording in 100ms intervals
+          const maxChunks = Math.ceil((bufferLimitSeconds * 1000) / recordingIntervalMs)
           
-          // Update buffered duration
-          const oldestTimestamp = audioChunksRef.current.length > 0 ? audioChunksRef.current[0].timestamp : timestamp
-          const duration = Math.min((timestamp - oldestTimestamp) / 1000, bufferLimitSeconds)
-          setBufferedDuration(duration)
+          console.log(`🔧 BUFFER DEBUG: bufferLimitSeconds=${bufferLimitSeconds}, maxChunks=${maxChunks}`)
+          
+          // Debug: Show before trimming
+          const beforeCount = audioChunksRef.current.length
+          
+          // Always maintain exact buffer size - remove excess chunks from the beginning
+          let removedCount = 0
+          while (audioChunksRef.current.length > maxChunks) {
+            const removedChunk = audioChunksRef.current.shift() // Remove oldest chunk
+            removedCount++
+            if (removedCount <= 3) { // Only log first few to avoid spam
+              console.log(`🗑️ Removed chunk #${removedCount} of size: ${removedChunk?.size || 0} bytes`)
+            }
+          }
+          if (removedCount > 3) {
+            console.log(`🗑️ ... and ${removedCount - 3} more chunks removed`)
+          }
+          
+          const afterCount = audioChunksRef.current.length
+          
+          console.log(`📊 T+${(timeSinceStart/1000).toFixed(1)}s Buffer: ${beforeCount}→${afterCount}/${maxChunks} chunks, Latest: ${chunkSize}B, Limit: ${bufferLimitSeconds}s`)
+          
+          // Update buffered duration based on actual chunks kept
+          // Calculate actual chunk duration based on real timing, not assumed 100ms
+          const actualChunkDurationMs = audioChunksRef.current.length > 0 ? timeSinceStart / audioChunksRef.current.length : recordingIntervalMs
+          const actualDuration = Math.min(
+            audioChunksRef.current.length * (actualChunkDurationMs / 1000), 
+            bufferLimitSeconds
+          )
+          setBufferedDuration(actualDuration)
+          
+          if (audioChunksRef.current.length <= 5) { // Log only first few to avoid spam
+            console.log(`⏱️ Actual chunk duration: ${actualChunkDurationMs.toFixed(0)}ms (expected: ${recordingIntervalMs}ms)`)
+          }
         }
       }
       
@@ -166,35 +298,69 @@ export default function Home() {
     setIsTranscribing(true)
     
     try {
-      // Stop recording if still recording
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      // Always stop recording when transcribing
+      const isCurrentlyRecording = mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording'
+      
+      if (isCurrentlyRecording) {
+        // Stop recording and wait for final chunks
         stopRecording()
-        // Wait a bit for the recording to stop
-        await new Promise(resolve => setTimeout(resolve, 200))
+        await new Promise(resolve => setTimeout(resolve, 300))
       }
       
-      // Create audio blob from the latest X seconds of chunks based on user selection
-      const currentTime = Date.now()
-      const bufferLimitMs = bufferLimitSeconds * 1000
-      const cutoffTime = currentTime - bufferLimitMs
-      const recentChunks = audioChunksRef.current
-        .filter(chunk => chunk.timestamp >= cutoffTime)
-        .map(chunk => chunk.blob)
-      
-      if (recentChunks.length === 0) {
-        alert('No recent audio data available')
+      // Get the current buffer - this should already be limited to the buffer duration
+      if (audioChunksRef.current.length === 0) {
+        alert('No audio data available for transcription')
         return
       }
       
-      const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm'
-      const audioBlob = new Blob(recentChunks, { type: mimeType })
+      // Use raw audio buffer for safe trimming
+      const audioBuffer = audioBufferRef.current
+      if (audioBuffer.length === 0) {
+        alert('No raw audio data available')
+        return
+      }
       
-      console.log(`Sending ${recentChunks.length} audio chunks covering ${bufferedDuration.toFixed(1)} seconds (${bufferLimitSeconds}s limit) to API`)
+      // Calculate total samples and duration
+      const totalSamples = audioBuffer.reduce((sum, buf) => sum + buf.length, 0)
+      const totalAvailableDuration = totalSamples / sampleRate.current
+      const requestedDuration = Math.min(transcribeDurationSeconds, totalAvailableDuration)
+      
+      console.log(`🔍 Total available duration: ${totalAvailableDuration.toFixed(1)}s (${totalSamples} samples)`)
+      console.log(`🎯 Requested trim to last: ${requestedDuration.toFixed(1)}s`)
+      
+      // Calculate how many samples to keep from the end
+      const samplesToKeep = Math.floor(requestedDuration * sampleRate.current)
+      
+      // Trim the audio buffer to the last N samples
+      const trimmedAudioData = trimAudioBuffer(audioBuffer, samplesToKeep)
+      
+      console.log(`✂️ Trimmed from ${totalSamples} to ${trimmedAudioData.length} samples`)
+      console.log(`📉 Reduced from ${totalAvailableDuration.toFixed(1)}s to ${(trimmedAudioData.length / sampleRate.current).toFixed(1)}s`)
+      
+      // Convert to WAV blob (can be safely trimmed)
+      const audioBlob = createWavBlob(trimmedAudioData, sampleRate.current)
+      const estimatedDurationSeconds = trimmedAudioData.length / sampleRate.current
+      
+      console.log(`=== TRANSCRIPTION DEBUG ===`)
+      console.log(`Buffer limit setting: ${bufferLimitSeconds}s`)
+      console.log(`Transcribe duration setting: ${transcribeDurationSeconds}s`)
+      console.log(`Requested duration: ${requestedDuration}s`)
+      console.log(`Total samples available: ${totalSamples}`)
+      console.log(`Total available duration: ${totalAvailableDuration.toFixed(1)}s`)
+      console.log(`Samples to transcribe: ${trimmedAudioData.length}`)
+      console.log(`Estimated duration: ${estimatedDurationSeconds.toFixed(1)}s`)
       console.log(`Audio blob size: ${(audioBlob.size / 1024).toFixed(1)} KB`)
       
-      // Create FormData to send the file
+      // Show successful frontend trimming
+      console.log(`✅ FRONTEND TRIMMING SUCCESSFUL`)
+      console.log(`📉 Sending ${(audioBlob.size / 1024).toFixed(1)} KB WAV file instead of full buffer`)
+      
+      // Create FormData with trimmed WAV file
       const formData = new FormData()
-      formData.append('audioFile', audioBlob, `recording.${fileExtensionRef.current}`)
+      formData.append('audioFile', audioBlob, 'recording.wav')
+      
+      console.log(`📤 Sending to API: ${(audioBlob.size / 1024).toFixed(1)} KB trimmed WAV file`)
+      console.log(`🎯 Contains exactly ${estimatedDurationSeconds.toFixed(1)}s of audio (last ${requestedDuration}s requested)`)
       
       // Send to API
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/transcription/transcribe`, {
@@ -225,7 +391,7 @@ export default function Home() {
     } finally {
       setIsTranscribing(false)
     }
-  }, [stopRecording, bufferedDuration, bufferLimitSeconds])
+  }, [bufferLimitSeconds, transcribeDurationSeconds, stopRecording])
   
   return (
     <div className="min-h-screen bg-black text-white p-6">
@@ -289,10 +455,7 @@ export default function Home() {
                       {Math.floor(recordingTime / 60).toString().padStart(2, '0')}:
                       {(recordingTime % 60).toString().padStart(2, '0')}
                     </div>
-                    
-                    <div className="text-sm text-gray-400">
-                      Buffer: {bufferedDuration.toFixed(1)}s / {bufferLimitSeconds}s
-                    </div>
+                  
                     
                     {/* Audio Waveform Visualization */}
                     <div className="flex items-center justify-center space-x-1 h-16">
@@ -376,24 +539,26 @@ export default function Home() {
                 </div>
               )}
               
-              {/* Buffer Duration Selector */}
+              {/* Transcription Duration Selector */}
               <div className="mb-6">
-                <label className="block text-sm text-gray-400 mb-2">Buffer Duration</label>
+                <label className="block text-sm text-gray-400 mb-2 text-center">
+                  Transcribe Last
+                  <span className="text-xs text-gray-500 block">How many seconds from the end to transcribe</span>
+                </label>
                 <select
-                  value={bufferLimitSeconds}
-                  onChange={(e) => setBufferLimitSeconds(Number(e.target.value))}
-                  className={`rounded-xl px-4 py-2 text-sm focus:outline-none transition-colors ${
-                    isTranscribing || state === 'recording'
+                  value={transcribeDurationSeconds}
+                  onChange={(e) => setTranscribeDurationSeconds(Number(e.target.value))}
+                  className={`w-full max-w-xs mx-auto block rounded-xl px-4 py-2 text-sm focus:outline-none transition-colors ${
+                    isTranscribing
                       ? 'bg-gray-900 border border-gray-800 text-gray-500 cursor-not-allowed'
                       : 'bg-gray-800 hover:bg-gray-700 border border-gray-700 text-white cursor-pointer focus:border-blue-500'
                   }`}
-                  disabled={isTranscribing || state === 'recording'}
+                  disabled={isTranscribing}
                 >
                   <option value={5}>5 seconds</option>
                   <option value={10}>10 seconds</option>
                   <option value={15}>15 seconds</option>
                   <option value={20}>20 seconds</option>
-                  <option value={25}>25 seconds</option>
                   <option value={30}>30 seconds</option>
                 </select>
               </div>
