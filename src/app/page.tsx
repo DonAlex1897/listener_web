@@ -481,11 +481,11 @@ export default function Home() {
                   value={transcribeDurationSeconds}
                   onChange={(e) => setTranscribeDurationSeconds(Number(e.target.value))}
                   className={`w-full max-w-xs mx-auto block rounded-xl px-4 py-2 text-sm focus:outline-none transition-colors ${
-                    isTranscribing
+                    isTranscribing || state === 'recording'
                       ? 'bg-gray-900 border border-gray-800 text-gray-500 cursor-not-allowed'
                       : 'bg-gray-800 hover:bg-gray-700 border border-gray-700 text-white cursor-pointer focus:border-blue-500'
                   }`}
-                  disabled={isTranscribing}
+                  disabled={isTranscribing || state === 'recording'}
                 >
                   <option value={5}>5 seconds</option>
                   <option value={10}>10 seconds</option>
