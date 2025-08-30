@@ -81,7 +81,6 @@ export default function Home() {
   const [showTranscription, setShowTranscription] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
   const [recordingTime, setRecordingTime] = useState(0)
-  const [bufferedDuration, setBufferedDuration] = useState(0)
   const [bufferLimitSeconds] = useState(30) // Fixed large buffer
   const [transcribeDurationSeconds, setTranscribeDurationSeconds] = useState(10) // User selectable
   
@@ -203,54 +202,20 @@ export default function Home() {
       audioChunksRef.current = []
       recordingStartTimeRef.current = Date.now()
       
-      // Log when recording actually starts
-      console.log(`🎤 RECORDING STARTED - Buffer cleared, limit: ${bufferLimitSeconds}s`)
-      
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          const now = Date.now()
-          const timeSinceStart = now - recordingStartTimeRef.current
-          const chunkSize = event.data.size
           audioChunksRef.current.push(event.data)
           
           // Maintain a strict sliding window buffer
           const recordingIntervalMs = 100 // We're recording in 100ms intervals
           const maxChunks = Math.ceil((bufferLimitSeconds * 1000) / recordingIntervalMs)
           
-          console.log(`🔧 BUFFER DEBUG: bufferLimitSeconds=${bufferLimitSeconds}, maxChunks=${maxChunks}`)
-          
-          // Debug: Show before trimming
-          const beforeCount = audioChunksRef.current.length
-          
           // Always maintain exact buffer size - remove excess chunks from the beginning
-          let removedCount = 0
           while (audioChunksRef.current.length > maxChunks) {
-            const removedChunk = audioChunksRef.current.shift() // Remove oldest chunk
-            removedCount++
-            if (removedCount <= 3) { // Only log first few to avoid spam
-              console.log(`🗑️ Removed chunk #${removedCount} of size: ${removedChunk?.size || 0} bytes`)
-            }
-          }
-          if (removedCount > 3) {
-            console.log(`🗑️ ... and ${removedCount - 3} more chunks removed`)
+            audioChunksRef.current.shift() // Remove oldest chunk
           }
           
-          const afterCount = audioChunksRef.current.length
-          
-          console.log(`📊 T+${(timeSinceStart/1000).toFixed(1)}s Buffer: ${beforeCount}→${afterCount}/${maxChunks} chunks, Latest: ${chunkSize}B, Limit: ${bufferLimitSeconds}s`)
-          
-          // Update buffered duration based on actual chunks kept
-          // Calculate actual chunk duration based on real timing, not assumed 100ms
-          const actualChunkDurationMs = audioChunksRef.current.length > 0 ? timeSinceStart / audioChunksRef.current.length : recordingIntervalMs
-          const actualDuration = Math.min(
-            audioChunksRef.current.length * (actualChunkDurationMs / 1000), 
-            bufferLimitSeconds
-          )
-          setBufferedDuration(actualDuration)
-          
-          if (audioChunksRef.current.length <= 5) { // Log only first few to avoid spam
-            console.log(`⏱️ Actual chunk duration: ${actualChunkDurationMs.toFixed(0)}ms (expected: ${recordingIntervalMs}ms)`)
-          }
+          // Buffer management complete
         }
       }
       
@@ -283,7 +248,6 @@ export default function Home() {
       }
       
       setAudioLevel(0)
-      setBufferedDuration(0)
     }
   }, [])
   
@@ -325,42 +289,18 @@ export default function Home() {
       const totalAvailableDuration = totalSamples / sampleRate.current
       const requestedDuration = Math.min(transcribeDurationSeconds, totalAvailableDuration)
       
-      console.log(`🔍 Total available duration: ${totalAvailableDuration.toFixed(1)}s (${totalSamples} samples)`)
-      console.log(`🎯 Requested trim to last: ${requestedDuration.toFixed(1)}s`)
-      
       // Calculate how many samples to keep from the end
       const samplesToKeep = Math.floor(requestedDuration * sampleRate.current)
       
       // Trim the audio buffer to the last N samples
       const trimmedAudioData = trimAudioBuffer(audioBuffer, samplesToKeep)
       
-      console.log(`✂️ Trimmed from ${totalSamples} to ${trimmedAudioData.length} samples`)
-      console.log(`📉 Reduced from ${totalAvailableDuration.toFixed(1)}s to ${(trimmedAudioData.length / sampleRate.current).toFixed(1)}s`)
-      
       // Convert to WAV blob (can be safely trimmed)
       const audioBlob = createWavBlob(trimmedAudioData, sampleRate.current)
-      const estimatedDurationSeconds = trimmedAudioData.length / sampleRate.current
-      
-      console.log(`=== TRANSCRIPTION DEBUG ===`)
-      console.log(`Buffer limit setting: ${bufferLimitSeconds}s`)
-      console.log(`Transcribe duration setting: ${transcribeDurationSeconds}s`)
-      console.log(`Requested duration: ${requestedDuration}s`)
-      console.log(`Total samples available: ${totalSamples}`)
-      console.log(`Total available duration: ${totalAvailableDuration.toFixed(1)}s`)
-      console.log(`Samples to transcribe: ${trimmedAudioData.length}`)
-      console.log(`Estimated duration: ${estimatedDurationSeconds.toFixed(1)}s`)
-      console.log(`Audio blob size: ${(audioBlob.size / 1024).toFixed(1)} KB`)
-      
-      // Show successful frontend trimming
-      console.log(`✅ FRONTEND TRIMMING SUCCESSFUL`)
-      console.log(`📉 Sending ${(audioBlob.size / 1024).toFixed(1)} KB WAV file instead of full buffer`)
       
       // Create FormData with trimmed WAV file
       const formData = new FormData()
       formData.append('audioFile', audioBlob, 'recording.wav')
-      
-      console.log(`📤 Sending to API: ${(audioBlob.size / 1024).toFixed(1)} KB trimmed WAV file`)
-      console.log(`🎯 Contains exactly ${estimatedDurationSeconds.toFixed(1)}s of audio (last ${requestedDuration}s requested)`)
       
       // Send to API
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/transcription/transcribe`, {
@@ -368,21 +308,13 @@ export default function Home() {
       body: formData,
       })
       
-      console.log('Response status:', response.status)
-      console.log('Response OK:', response.ok)
-      
       if (response.ok) {
         const responseText = await response.text()
-        console.log('Raw response:', responseText)
-        
         const result: TranscriptionResponse = JSON.parse(responseText)
-        console.log('Parsed result:', result)
-        
         setTranscription(result.segments)
         setShowTranscription(true)
       } else {
         const errorText = await response.text()
-        console.log('Error response:', errorText)
         throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`)
       }
     } catch (error) {
@@ -391,7 +323,7 @@ export default function Home() {
     } finally {
       setIsTranscribing(false)
     }
-  }, [bufferLimitSeconds, transcribeDurationSeconds, stopRecording])
+  }, [transcribeDurationSeconds, stopRecording])
   
   return (
     <div className="min-h-screen bg-black text-white p-6">
